@@ -1,0 +1,22 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "server": "nodemon index.js",
+    "client": "cd ../ && cd client && pnpm dev",
+    "dev": "concurrently pnpm:server pnpm:client"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.22.0",
+  "dependencies": {
+    "concurrently": "^9.2.1",
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "nodemon": "^3.1.11"
+  }
+}
