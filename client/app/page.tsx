@@ -1,17 +1,73 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { GestureRecognizer, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision"
+import { GestureRecognizer, FilesetResolver, DrawingUtils, HandLandmarker } from "@mediapipe/tasks-vision"
+import Fetch from "@/Fetch"
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [isLoading, setIsLoading] = useState(true)
-  const gestureRecognizerRef = useRef<GestureRecognizer | null>(null)
+  const gestureRecognizerRef = useRef<HandLandmarker | null>(null)
   const animationFrameIdRef = useRef<number>(0)
+  let lastSent = 0
+  let lastX = 0
+  let lastY = 0
+   let pinching = false
+  const SMOOTHING = 0.7
+
+  function detectCursor(landmarks: any) {
+    const indexTip = landmarks[8]
+
+    const targetX = (1 - indexTip.x) * window.screen.width
+    const targetY = indexTip.y * window.screen.height
+
+    // smoothing (VERY IMPORTANT)
+    const x = lastX * SMOOTHING + targetX * (1 - SMOOTHING)
+    const y = lastY * SMOOTHING + targetY * (1 - SMOOTHING)
+
+    lastX = x
+    lastY = y
+
+    sendMouseMove(x, y)
+  }
+
+  function isMiddlePinching(landmarks: any) {
+    const thumb = landmarks[4]
+    const middle = landmarks[12]
+
+    const dist = Math.hypot(
+      thumb.x - middle.x,
+      thumb.y - middle.y,
+      thumb.z - middle.z
+    )
+
+    // Start pinch
+    if (!pinching && dist < 0.035) {
+      pinching = true
+      return "PINCH_START"
+    }
+
+    // Release pinch
+    if (pinching && dist > 0.05) {
+      pinching = false
+      return "PINCH_END"
+    }
+
+    return pinching ? "PINCH_HOLD" : "NO_PINCH"
+  }
+
+  function sendMouseMove(x: number, y: number) {
+    const now = Date.now()
+    if (now - lastSent < 100) return // ~10fps
+    Fetch.post('/gesture', { action: 'cursor', x, y })
+    lastSent = now
+  }
 
   useEffect(() => {
     let isActive = true
+    let lastVideoTime = 0
+    let lastPinchTime = 0
 
     const initializeGestureRecognizer = async () => {
       try {
@@ -19,10 +75,10 @@ export default function Home() {
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
         )
 
-        const gestureRecognizer = await GestureRecognizer.createFromOptions(vision, {
+        const handLandmarker = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
             delegate: "GPU",
           },
           numHands: 1,
@@ -31,11 +87,11 @@ export default function Home() {
 
         if (!isActive) return
 
-        gestureRecognizerRef.current = gestureRecognizer
+        gestureRecognizerRef.current = handLandmarker
         setIsLoading(false)
         await startCamera()
       } catch (error) {
-        console.error("Error initializing gesture recognizer:", error)
+        console.error("Error initializing hand landmarker:", error)
         setIsLoading(false)
       }
     }
@@ -71,9 +127,18 @@ export default function Home() {
       const canvas = canvasRef.current
       const ctx = canvas.getContext("2d")!
 
+      const now = Date.now()
+      // Limit to ~24 FPS (approx 42ms per frame) to reduce CPU usage
+      if (now - lastVideoTime < 40) {
+        animationFrameIdRef.current = requestAnimationFrame(processFrame)
+        return
+      }
+      lastVideoTime = now
+
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         const startTimeMs = performance.now()
-        const results = gestureRecognizerRef.current.recognizeForVideo(video, startTimeMs)
+        // HandLandmarker uses detectForVideo
+        const results = gestureRecognizerRef.current.detectForVideo(video, startTimeMs)
 
         // Clear canvas
         ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -85,7 +150,7 @@ export default function Home() {
           for (const landmarks of results.landmarks) {
             drawingUtils.drawConnectors(
               landmarks,
-              GestureRecognizer.HAND_CONNECTIONS,
+              HandLandmarker.HAND_CONNECTIONS,
               { color: "#00FF00", lineWidth: 5 }
             )
             drawingUtils.drawLandmarks(landmarks, {
@@ -94,28 +159,26 @@ export default function Home() {
             })
           }
 
-          // Check for gestures
-          if (results.gestures && results.gestures.length > 0) {
-            const gesture = results.gestures[0][0]
-            console.log(gesture);
-            
-            // if (gesture.categoryName) {
-            //   console.log(`Gesture detected: ${gesture.categoryName} (${(gesture.score * 100).toFixed(0)}%)`)
-            // }
-          }
+          // HandLandmarker does not return 'gestures', only landmarks.
+          // We removed the gesture checking block.
 
           // Custom pinch detection
           const landmarks = results.landmarks[0]
           const thumbTip = landmarks[4]
           const indexTip = landmarks[8]
 
-          const distance = Math.hypot(
-            thumbTip.x - indexTip.x,
-            thumbTip.y - indexTip.y
-          )
-
-          if (distance < 0.05) {
-            console.log("🤏 PINCH")
+          detectCursor(landmarks)
+          const isPinching = isMiddlePinching(landmarks)
+          if (isPinching === "PINCH_START") {
+            const now = Date.now()
+            if (now - lastPinchTime < 300) {
+              Fetch.post('/gesture', { action: 'double-tap' })
+              console.log("Double Tap")
+            } else {
+              Fetch.post('/gesture', { action: 'pinch' })
+              console.log("Single Tap")
+            }
+            lastPinchTime = now
           }
         }
       }
@@ -124,7 +187,6 @@ export default function Home() {
     }
 
     initializeGestureRecognizer()
-
     return () => {
       isActive = false
       if (animationFrameIdRef.current) {
