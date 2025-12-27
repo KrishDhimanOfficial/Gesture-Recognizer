@@ -1,75 +1,93 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { GestureRecognizer, FilesetResolver, DrawingUtils, HandLandmarker } from "@mediapipe/tasks-vision"
+import { FilesetResolver, DrawingUtils, HandLandmarker } from "@mediapipe/tasks-vision"
 import Fetch from "@/Fetch"
+
+// Modern design system
+const COLORS = {
+  primary: "#6366f1",
+  secondary: "#a855f7",
+  accent: "#ec4899",
+  success: "#10b981",
+  background: "rgba(10, 10, 15, 0.7)",
+  border: "rgba(255, 255, 255, 0.1)",
+}
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [activeHand, setActiveHand] = useState<string | null>(null)
+  const [isPinching, setIsPinching] = useState(false)
   const gestureRecognizerRef = useRef<HandLandmarker | null>(null)
   const animationFrameIdRef = useRef<number>(0)
-  let lastSent = 0
-  let lastX = 0
-  let lastY = 0
-   let pinching = false
-  const SMOOTHING = 0.7
 
-  function detectCursor(landmarks: any) {
+  // High-performance state storage to avoid React overhead in the loop
+  const trackerState = useRef({
+    lastSent: 0,
+    lastX: 0,
+    lastY: 0,
+    isPinching: false,
+    lastPinchTime: 0,
+    smoothing: 0.75
+  })
+
+  function processCursor(landmarks: any) {
     const indexTip = landmarks[8]
 
+    // Mapping 0-1 range to screen resolution
+    // Using (1 - indexTip.x) because the video is mirrored for the user
     const targetX = (1 - indexTip.x) * window.screen.width
     const targetY = indexTip.y * window.screen.height
 
-    // smoothing (VERY IMPORTANT)
-    const x = lastX * SMOOTHING + targetX * (1 - SMOOTHING)
-    const y = lastY * SMOOTHING + targetY * (1 - SMOOTHING)
+    const { lastX, lastY, smoothing } = trackerState.current
 
-    lastX = x
-    lastY = y
+    const x = lastX * smoothing + targetX * (1 - smoothing)
+    const y = lastY * smoothing + targetY * (1 - smoothing)
 
-    sendMouseMove(x, y)
+    trackerState.current.lastX = x
+    trackerState.current.lastY = y
+
+    sendUpdate(x, y)
   }
 
-  function isMiddlePinching(landmarks: any) {
+  function detectPinch(landmarks: any) {
     const thumb = landmarks[4]
     const middle = landmarks[12]
 
-    const dist = Math.hypot(
+    const distance = Math.hypot(
       thumb.x - middle.x,
       thumb.y - middle.y,
       thumb.z - middle.z
     )
 
-    // Start pinch
-    if (!pinching && dist < 0.035) {
-      pinching = true
-      return "PINCH_START"
+    // Pinch thresholding
+    if (!trackerState.current.isPinching && distance < 0.035) {
+      trackerState.current.isPinching = true
+      return "START"
     }
 
-    // Release pinch
-    if (pinching && dist > 0.05) {
-      pinching = false
-      return "PINCH_END"
+    if (trackerState.current.isPinching && distance > 0.05) {
+      trackerState.current.isPinching = false
+      return "END"
     }
 
-    return pinching ? "PINCH_HOLD" : "NO_PINCH"
+    return trackerState.current.isPinching ? "HOLD" : "NONE"
   }
 
-  function sendMouseMove(x: number, y: number) {
+  function sendUpdate(x: number, y: number) {
     const now = Date.now()
-    if (now - lastSent < 100) return // ~10fps
+    if (now - trackerState.current.lastSent < 60) return // ~16 FPS limit for mouse updates
     Fetch.post('/gesture', { action: 'cursor', x, y })
-    lastSent = now
+    trackerState.current.lastSent = now
   }
 
   useEffect(() => {
-    let isActive = true
-    let lastVideoTime = 0
-    let lastPinchTime = 0
+    let mounted = true
+    let lastProcessTime = 0
 
-    const initializeGestureRecognizer = async () => {
+    const init = async () => {
       try {
         const vision = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
@@ -77,146 +95,221 @@ export default function Home() {
 
         const handLandmarker = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
             delegate: "GPU",
           },
-          numHands: 1,
+          numHands: 2,
           runningMode: "VIDEO",
         })
 
-        if (!isActive) return
-
+        if (!mounted) return
         gestureRecognizerRef.current = handLandmarker
         setIsLoading(false)
-        await startCamera()
-      } catch (error) {
-        console.error("Error initializing hand landmarker:", error)
+        setupCamera()
+      } catch (err) {
+        console.error("Initialization failed:", err)
         setIsLoading(false)
       }
     }
 
-    const startCamera = async () => {
-      if (!videoRef.current || !canvasRef.current) return
-
+    const setupCamera = async () => {
+      if (!videoRef.current) return
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: 1280, height: 720 },
         })
-
         videoRef.current.srcObject = stream
-
         videoRef.current.onloadedmetadata = () => {
           if (canvasRef.current && videoRef.current) {
             canvasRef.current.width = videoRef.current.videoWidth
             canvasRef.current.height = videoRef.current.videoHeight
-            processFrame()
+            loop()
           }
         }
-      } catch (error) {
-        console.error("Error accessing camera:", error)
+      } catch (err) {
+        console.error("Camera access denied:", err)
       }
     }
 
-    const processFrame = () => {
-      if (!videoRef.current || !canvasRef.current || !gestureRecognizerRef.current) {
-        return
-      }
-
-      const video = videoRef.current
-      const canvas = canvasRef.current
-      const ctx = canvas.getContext("2d")!
+    const loop = () => {
+      if (!videoRef.current || !canvasRef.current || !gestureRecognizerRef.current) return
 
       const now = Date.now()
-      // Limit to ~24 FPS (approx 42ms per frame) to reduce CPU usage
-      if (now - lastVideoTime < 40) {
-        animationFrameIdRef.current = requestAnimationFrame(processFrame)
+      if (now - lastProcessTime < 30) { // Limit to 33 FPS
+        animationFrameIdRef.current = requestAnimationFrame(loop)
         return
       }
-      lastVideoTime = now
+      lastProcessTime = now
 
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        const startTimeMs = performance.now()
-        // HandLandmarker uses detectForVideo
-        const results = gestureRecognizerRef.current.detectForVideo(video, startTimeMs)
+      if (videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
+        const results = gestureRecognizerRef.current.detectForVideo(videoRef.current, performance.now())
+        const ctx = canvasRef.current.getContext("2d")!
+        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
 
-        // Clear canvas
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        let leftHandFound = false
 
-        // Draw landmarks if detected
         if (results.landmarks && results.landmarks.length > 0) {
           const drawingUtils = new DrawingUtils(ctx)
 
-          for (const landmarks of results.landmarks) {
-            drawingUtils.drawConnectors(
-              landmarks,
-              HandLandmarker.HAND_CONNECTIONS,
-              { color: "#00FF00", lineWidth: 5 }
-            )
-            drawingUtils.drawLandmarks(landmarks, {
-              color: "#FF0000",
-              lineWidth: 2,
+          for (let i = 0; i < results.landmarks.length; i++) {
+            const hand = results.landmarks[i]
+            const type = results.handedness[i][0].categoryName // "Left" or "Right"
+            const isTarget = type === "Left"
+
+            if (isTarget) {
+              leftHandFound = true
+              processCursor(hand)
+
+              const pinchAction = detectPinch(hand)
+              if (pinchAction === "START") {
+                setIsPinching(true)
+                const pinchNow = Date.now()
+                if (pinchNow - trackerState.current.lastPinchTime < 400) {
+                  Fetch.post('/gesture', { action: 'double-tap' })
+                  console.log('double-tap')
+                } else {
+                  Fetch.post('/gesture', { action: 'pinch' })
+                  console.log('pinch')
+                }
+                trackerState.current.lastPinchTime = pinchNow
+              } else if (pinchAction === "END") {
+                setIsPinching(false)
+              }
+            }
+
+            // Enhanced visualization
+            drawingUtils.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS, {
+              color: isTarget ? "#00FF00" : "rgba(255, 255, 255, 0.2)",
+              lineWidth: isTarget ? 4 : 2
+            })
+            drawingUtils.drawLandmarks(hand, {
+              color: isTarget ? "#FF0000" : "rgba(255, 255, 255, 0.1)",
+              lineWidth: 1
             })
           }
-
-          // HandLandmarker does not return 'gestures', only landmarks.
-          // We removed the gesture checking block.
-
-          // Custom pinch detection
-          const landmarks = results.landmarks[0]
-          const thumbTip = landmarks[4]
-          const indexTip = landmarks[8]
-
-          detectCursor(landmarks)
-          const isPinching = isMiddlePinching(landmarks)
-          if (isPinching === "PINCH_START") {
-            const now = Date.now()
-            if (now - lastPinchTime < 300) {
-              Fetch.post('/gesture', { action: 'double-tap' })
-              console.log("Double Tap")
-            } else {
-              Fetch.post('/gesture', { action: 'pinch' })
-              console.log("Single Tap")
-            }
-            lastPinchTime = now
-          }
         }
+
+        setActiveHand(leftHandFound ? "Left Hand" : null)
       }
 
-      animationFrameIdRef.current = requestAnimationFrame(processFrame)
+      animationFrameIdRef.current = requestAnimationFrame(loop)
     }
 
-    initializeGestureRecognizer()
+    init()
+
     return () => {
-      isActive = false
-      if (animationFrameIdRef.current) {
-        cancelAnimationFrame(animationFrameIdRef.current)
-      }
-      const stream = videoRef.current?.srcObject as MediaStream
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop())
-      }
-      if (gestureRecognizerRef.current) {
-        gestureRecognizerRef.current.close()
-      }
+      mounted = false
+      if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current)
+      const tracks = (videoRef.current?.srcObject as MediaStream)?.getTracks()
+      tracks?.forEach(t => t.stop())
+      gestureRecognizerRef.current?.close()
     }
   }, [])
 
   return (
-    <main style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden" }}>
+    <main style={{
+      position: "relative",
+      width: "100vw",
+      height: "100vh",
+      overflow: "hidden",
+      background: "#050505",
+      fontFamily: "var(--font-geist-sans), system-ui"
+    }}>
       {isLoading && (
         <div style={{
           position: "absolute",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          fontSize: "24px",
-          color: "white",
-          zIndex: 10
+          inset: 0,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#050505",
+          zIndex: 100,
+          color: "white"
         }}>
-          Loading gesture recognizer...
+          <div style={{
+            width: "50px",
+            height: "50px",
+            border: "2px solid #333",
+            borderTopColor: COLORS.primary,
+            borderRadius: "50%",
+            animation: "spin 1s linear infinite",
+            marginBottom: "20px"
+          }} />
+          <div style={{ letterSpacing: "4px", fontSize: "12px", opacity: 0.7 }}>BOOTING GESTURE ENGINE...</div>
         </div>
       )}
+
+      {/* Control Overlay */}
+      <div style={{
+        position: "absolute",
+        top: "40px",
+        left: "40px",
+        zIndex: 50,
+        display: "flex",
+        flexDirection: "column",
+        gap: "15px"
+      }}>
+        {/* <div style={{
+          background: COLORS.background,
+          backdropFilter: "blur(20px)",
+          padding: "20px 30px",
+          borderRadius: "20px",
+          border: `1px solid ${COLORS.border}`,
+          boxShadow: "0 20px 40px rgba(0,0,0,0.4)"
+        }}>
+          {/* <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "8px" }}>
+            <div style={{
+              width: "8px",
+              height: "8px",
+              background: activeHand ? COLORS.success : "#ff4444",
+              borderRadius: "50%",
+              boxShadow: activeHand ? `0 0 10px ${COLORS.success}` : "none"
+            }} />
+            <h1 style={{ margin: 0, fontSize: "16px", fontWeight: 600, color: "white", letterSpacing: "1px" }}>
+              GESTURE CORE v2.0
+            </h1>
+          </div>
+          <div style={{ fontSize: "11px", color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: "1.5px" }}>
+            Target: {activeHand || "Searching for Left Hand..."}
+          </div>
+        </div> */}
+
+        <div style={{
+          background: isPinching ? COLORS.accent : COLORS.background,
+          backdropFilter: "blur(20px)",
+          padding: "12px 24px",
+          borderRadius: "15px",
+          border: `1px solid ${COLORS.border}`,
+          color: "white",
+          fontSize: "13px",
+          fontWeight: 600,
+          transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          transform: isPinching ? "scale(1.05)" : "scale(1)"
+        }}>
+          {isPinching ? "🎯 PINCH ACTIVE" : "🖐 READY TO PINCH"}
+        </div>
+      </div>
+
+      {/* <div style={{
+        position: "absolute",
+        bottom: "40px",
+        right: "40px",
+        background: COLORS.background,
+        backdropFilter: "blur(10px)",
+        padding: "8px 16px",
+        borderRadius: "100px",
+        border: `1px solid ${COLORS.border}`,
+        fontSize: "10px",
+        color: "rgba(255,255,255,0.3)",
+        letterSpacing: "1px"
+      }}>
+        L-HAND ISOLATION ENABLED
+      </div> */}
+
       <video
         ref={videoRef}
         autoPlay
@@ -225,7 +318,8 @@ export default function Home() {
           transform: "scaleX(-1)",
           width: "100%",
           height: "100%",
-          objectFit: "cover"
+          objectFit: "cover",
+          opacity: 0.8
         }}
       />
       <canvas
@@ -236,9 +330,17 @@ export default function Home() {
           left: 0,
           transform: "scaleX(-1)",
           width: "100%",
-          height: "100%"
+          height: "100%",
+          pointerEvents: "none"
         }}
       />
+
+      <style jsx global>{`
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+        body { margin: 0; background: #050505; }
+      `}</style>
     </main>
   )
 }

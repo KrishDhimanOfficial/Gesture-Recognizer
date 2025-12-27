@@ -1,12 +1,14 @@
 import express from "express"
 import { exec } from "node:child_process"
 import cors from 'cors'
+import { createServer } from "node:http"
 const app = express()
 
 app.use(cors({
     origin: 'http://localhost:3000',
     allowedHeaders: ['Content-Type', 'Authorization']
 }))
+
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
@@ -26,6 +28,8 @@ app.post('/api/gesture', (req, res) => {
     return res.status(200).json({ ok: true })
 })
 
-app.listen(4000, () => {
-    console.log("Server started on port 3000")
+const Server = createServer(app)
+
+Server.listen(4000, () => {
+    console.log("Server started on port 4000")
 })
