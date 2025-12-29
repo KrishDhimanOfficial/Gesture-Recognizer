@@ -102,12 +102,6 @@ pnpm dev
 
 ---
 
-## 📜 License
-
-Distributed under the ISC License. See `LICENSE` for more information.
-
----
-
 <p align="center">
   Developed with ❤️ by <a href="https://github.com/KrishDhimanOfficial">Krish Dhiman</a>
 </p>
