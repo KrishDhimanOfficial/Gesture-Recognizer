@@ -1,8 +1,8 @@
-# 🖐 Gesture Core v2.0
+# 🖐 Gesture Reconiger
 
 > **Transform your hands into a virtual mouse with high-performance gesture recognition.**
 
-Gesture Core is a cutting-edge MERN stack application that leverages **MediaPipe's Computer Vision** to track hand landmarks in real-time and translate them into system-level cursor movements and actions on macOS.
+Gesture Reconiger is a cutting-edge MERN stack application that leverages **MediaPipe's Computer Vision** to track hand landmarks in real-time and translate them into system-level cursor movements and actions on macOS.
 
 ---
 
